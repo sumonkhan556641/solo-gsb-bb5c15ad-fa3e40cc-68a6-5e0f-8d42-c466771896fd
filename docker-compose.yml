@@ -1,0 +1,28 @@
+services:
+  resolver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local-dep-resolver:latest
+    container_name: local-dep-resolver
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      # SQLite file persisting asynchronous jobs. Lives in the named volume
+      # below, so queued and finished jobs survive `docker compose up
+      # --build` and container restarts.
+      RESOLVER_DB: /app/data/jobs.db
+    volumes:
+      - resolver-data:/app/data
+    # The service only needs the loopback/network you expose; it never calls
+    # an external package index.
+    networks:
+      - resolver-net
+
+volumes:
+  resolver-data:
+
+networks:
+  resolver-net:
+    driver: bridge

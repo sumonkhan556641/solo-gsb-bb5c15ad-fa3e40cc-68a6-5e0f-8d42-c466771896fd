@@ -1,0 +1,5 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+packaging==24.2
+pydantic==2.10.4
+license-expression==30.4.4

@@ -126,6 +126,118 @@ def test_lock_backtracked_note_when_locked_choice_fails_deeper():
     assert result.lock_notes["x"] == "backtracked"
 
 
+def test_lock_adopted_only_in_dead_branch_is_unused_in_final_branch():
+    # The higher app version pulls in the locked package lib (and adopts
+    # lib==1.0 lock-first), but that branch dies on a *different*
+    # transitive dependency (aaa -> ghost).  The successful lower app
+    # version never uses lib, so the lock must be "unused" — the temporary
+    # "applied" state of the abandoned branch must not leak into the result.
+    packages = {
+        "app": {
+            "1.0": {"dependencies": {"lib": "", "aaa": ""}},
+            "0.9": {},
+        },
+        "lib": {"1.0": {}},
+        "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+        "ghost": {},
+    }
+    result = solve(packages, {"app": ""}, locks={"lib": "1.0"})
+    assert result.status == "ok"
+    assert result.chosen == {"app": "0.9"}
+    assert "lib" not in result.chosen
+    assert result.lock_notes == {"lib": "unused"}
+
+
+def test_lock_backtracked_when_lock_version_falsified_other_version_chosen():
+    # Locked x==2.0 is tried first but its branch dies deeper; x==1.0 wins.
+    # The lock version satisfied the final constraints, so the disposition
+    # is "backtracked" (not "unsatisfiable").
+    packages = {
+        "x": {"2.0": {"dependencies": {"aaa": ""}}, "1.0": {}},
+        "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+        "ghost": {},
+    }
+    result = solve(packages, {"x": ""}, locks={"x": "2.0"})
+    assert result.status == "ok"
+    assert result.chosen == {"x": "1.0"}
+    assert result.lock_notes == {"x": "backtracked"}
+
+
+def test_lock_unsatisfiable_against_final_constraints():
+    # The lock violates the root constraint itself; another version wins.
+    result = solve(
+        {"x": {"1.0": {}, "2.0": {}}},
+        {"x": ">=2.0"},
+        locks={"x": "1.0"},
+    )
+    assert result.status == "ok"
+    assert result.chosen == {"x": "2.0"}
+    assert result.lock_notes == {"x": "unsatisfiable"}
+
+
+def test_failed_search_does_not_report_branch_local_lock_state():
+    # Globally unsatisfiable: the higher app branch adopts lib==1.0 before
+    # dying on ghost; but no successful branch exists. The branch-local
+    # temporary "applied" must not appear in the conflict result.
+    packages = {
+        "app": {
+            "1.0": {"dependencies": {"lib": "", "aaa": ""}},
+            "0.9": {},
+        },
+        "lib": {"1.0": {}},
+        "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+        "ghost": {},
+    }
+    result = solve(
+        packages, {"app": "", "ghost": "==1.0"}, locks={"lib": "1.0"}
+    )
+    assert result.status == "conflict"
+    assert "lib" not in result.lock_notes
+
+
+def test_conflict_reports_only_static_lock_facts():
+    # A lock contradicting the root requirements is infeasible in every
+    # branch and is still reported on a conflict.
+    packages = {
+        "x": {"1.0": {}, "2.0": {}},
+        "a": {"1.0": {"dependencies": {"x": "<2.0"}}},
+    }
+    result = solve(packages, {"x": ">=2.0", "a": ""}, locks={"x": "1.0"})
+    assert result.status == "conflict"
+    assert result.lock_notes == {"x": "unsatisfiable"}
+
+    # Unknown packages and missing versions are branch-independent too.
+    result2 = solve(
+        {"x": {"1.0": {}}, "a": {"1.0": {"dependencies": {"ghost": ""}}}},
+        {"a": ""},
+        locks={"x": "9.9", "y": "1.0"},
+    )
+    assert result2.status == "conflict"
+    assert result2.lock_notes == {"x": "missing-version", "y": "not-found"}
+
+
+def test_search_limit_does_not_report_temporary_lock_state():
+    packages = {}
+    for i in range(3):
+        packages[f"p{i}"] = {
+            f"{n}.0": {"dependencies": {f"p{i+1}": ""}} for n in range(1, 5)
+        }
+    packages["p3"] = {f"{n}.0": {} for n in range(1, 5)}
+    result = solve(packages, {"p0": ""}, locks={"p3": "4.0"}, max_attempts=3)
+    assert result.status == "limit"
+    assert result.lock_notes == {}
+
+
+def test_unused_valid_lock_when_package_never_demanded():
+    result = solve(
+        {"x": {"1.0": {}}, "z": {"1.0": {}}},
+        {"x": ""},
+        locks={"z": "1.0"},
+    )
+    assert result.status == "ok"
+    assert result.lock_notes == {"z": "unused"}
+
+
 def test_self_dependency_does_not_deadlock():
     result = solve(
         {"x": {"1.0": {"dependencies": {"x": ">=1.0"}}}},

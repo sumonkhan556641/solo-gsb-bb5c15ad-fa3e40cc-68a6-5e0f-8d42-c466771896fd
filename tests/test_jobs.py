@@ -88,6 +88,32 @@ def test_job_preserves_conflict_response_status_and_body(client):
     assert job["response"]["status"] == "conflict"
 
 
+def test_job_lock_disposition_follows_final_successful_branch(client):
+    # Same backtracking scenario as the /resolve regression: the lock is
+    # adopted only inside an abandoned branch and must be reported "unused"
+    # in the asynchronously stored response — never "applied".
+    payload = {
+        "packages": {
+            "app": {
+                "1.0": {"dependencies": {"lib": "", "aaa": ""}},
+                "0.9": {},
+            },
+            "lib": {"1.0": {}},
+            "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+            "ghost": {},
+        },
+        "root": {"app": ""},
+        "locks": {"lib": "1.0"},
+    }
+    jid = client.post("/jobs", json=payload).json()["id"]
+    job = wait_for(client, jid)
+    assert job["status"] == "succeeded"
+    assert job["response_status"] == 200
+    assert job["response"]["status"] == "ok"
+    assert job["response"]["resolved"] == {"app": "0.9"}
+    assert job["response"]["locks"] == {"lib": "unused"}
+
+
 def test_invalid_input_rejected_before_queueing(client):
     r = client.post("/jobs", json={"packages": {"x": {"bad-version": {}}}, "root": {"x": ""}})
     assert r.status_code == 400

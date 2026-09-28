@@ -61,6 +61,76 @@ def test_lock_is_abandoned_when_unsatisfiable():
     assert body["locks"]["x"] == "unsatisfiable"
 
 
+def test_lock_adopted_in_dead_branch_is_unused_in_final_solution():
+    # app 1.0 adopts the lib lock then fails on aaa->ghost; app 0.9 wins
+    # without ever using lib. The disposition must follow the final
+    # successful branch, not the abandoned exploration.
+    packages = {
+        "app": {
+            "1.0": {"dependencies": {"lib": "", "aaa": ""}},
+            "0.9": {},
+        },
+        "lib": {"1.0": {}},
+        "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+        "ghost": {},
+    }
+    status, body = _resolve(packages=packages, root={"app": ""}, locks={"lib": "1.0"})
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["resolved"] == {"app": "0.9"}
+    assert body["locks"] == {"lib": "unused"}
+
+
+def test_lock_falsified_then_other_version_chosen_is_backtracked():
+    packages = {
+        "x": {"2.0": {"dependencies": {"aaa": ""}}, "1.0": {}},
+        "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+        "ghost": {},
+    }
+    status, body = _resolve(packages=packages, root={"x": ""}, locks={"x": "2.0"})
+    assert status == 200
+    assert body["resolved"] == {"x": "1.0"}
+    assert body["locks"] == {"x": "backtracked"}
+
+
+def test_conflict_never_reports_dead_branch_lock_as_applied():
+    # No solution exists; lib's lock is adopted in the app 1.0 branch that
+    # later dies. The 409 body must not claim the lock was applied.
+    packages = {
+        "app": {
+            "1.0": {"dependencies": {"lib": "", "aaa": ""}},
+            "0.9": {},
+        },
+        "lib": {"1.0": {}},
+        "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+        "ghost": {},
+    }
+    status, body = _resolve(
+        packages=packages,
+        root={"app": "", "ghost": "==1.0"},
+        locks={"lib": "1.0"},
+    )
+    assert status == 409
+    assert body["status"] == "conflict"
+    assert body["locks"] == {}
+
+
+def test_limit_never_reports_dead_branch_lock_as_applied():
+    packages = {}
+    for i in range(3):
+        packages[f"p{i}"] = {
+            f"{major}.0": {"dependencies": {f"p{i+1}": ""}}
+            for major in range(1, 4)
+        }
+    packages["p3"] = {f"{major}.0": {} for major in range(1, 4)}
+    status, body = _resolve(
+        packages=packages, root={"p0": ""}, locks={"p3": "3.0"}, max_attempts=3
+    )
+    assert status == 409
+    assert body["status"] == "limit"
+    assert body["locks"] == {}
+
+
 def test_backtracking_finds_solution():
     status, body = _resolve(
         packages={

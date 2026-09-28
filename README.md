@@ -11,9 +11,11 @@
   等版本形式。
 - **传递依赖解析**：递归处理每个选定版本声明的依赖，支持依赖图中的环。
 - **锁定优先**：`locks` 中给出的版本只要仍满足所有约束，就会被优先保留；
-  锁定版本被更深层依赖证伪时，才按规则回溯到其他版本，返回结果里会说明每个锁的
-  处置（`applied` / `backtracked` / `unsatisfiable` / `missing-version` /
-  `not-found` / `unused`）。
+  锁定版本被更深层依赖证伪时，才按规则回溯到其他版本。每个锁的处置一律以
+  **最终成功分支**为准——最终采用锁版本为 `applied`，锁版本合格但被证伪后改选
+  其他版本为 `backtracked`，有效锁未被最终结果使用为 `unused`，另有
+  `unsatisfiable` / `missing-version` / `not-found`；无解或搜索触顶时只上报与
+  分支无关的静态锁事实，绝不把失败探索中的临时锁状态误报为成功处置。
 - **确定性回溯**：其余候选严格按版本**从高到低**尝试；候选顺序、依赖处理顺序、
   根需求顺序均为确定顺序，相同输入永远得到相同输出（含尝试次数）。
 - **默认排除预发布版**：`a/b/rc/dev` 等预发布默认不参与；可通过
@@ -1156,6 +1158,61 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 ```
 
 只要锁仍满足约束，`x` 解析为 `1.0`（而非最高的 `2.0`），`locks.x = "applied"`。
+
+### 锁处置（`locks`）以最终成功分支为准
+
+锁处置一律在搜索结束后、依据**最终成功分支**推导，而不是搜索过程中某个后被
+放弃的分支：
+
+- `applied`：锁版本即最终结果采用的版本；
+- `backtracked`：锁版本满足最终活动约束、曾被优先尝试，但在搜索中被证伪，
+  最终改选了同包的其他版本；
+- `unsatisfiable`：锁版本存在但违反最终活动约束（最终选了其他版本）；
+- `unused`：锁有效（包与版本存在、且对最终约束合格），但最终成功分支根本
+  没有使用该包；
+- `missing-version` / `not-found`：锁定版本 / 包在索引中不存在。
+
+典型回溯场景：较高版本先引入并采用了锁定包，随后该分支因**另一条传递依赖
+无解**而整体回退；最终可解分支不再使用该包时，该锁记为 `unused`，不会误报
+`applied`：
+
+```bash
+curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {
+      "1.0": {"dependencies": {"lib": "", "aaa": ""}},
+      "0.9": {}
+    },
+    "lib": {"1.0": {}},
+    "aaa": {"1.0": {"dependencies": {"ghost": ""}}},
+    "ghost": {}
+  },
+  "root": {"app": ""},
+  "locks": {"lib": "1.0"}
+}'
+```
+
+`app 1.0` 虽先采用 `lib==1.0`，但其 `aaa -> ghost` 无解，整支回退到
+`app 0.9`（不再依赖 `lib`）：
+
+```json
+{
+  "status": "ok",
+  "attempts": 4,
+  "resolved": {"app": "0.9"},
+  "dependency_graph": [ ... ],
+  "locks": {"lib": "unused"}
+}
+```
+
+同包锁版本被证伪、最终改选其他版本时记为 `backtracked`；锁版本本身违反最终
+约束时记为 `unsatisfiable`。
+
+**无解（`conflict`）或搜索触顶（`limit`）时不存在“最终分支”**：响应中的
+`locks` 只包含与分支无关的静态事实——违反根约束的 `unsatisfiable`、
+`missing-version`、`not-found`；只在某条被放弃分支里临时采用的锁不会被当作
+成功处置（`applied` / `backtracked`）上报。`POST /jobs` 异步作业复用同一解析器，
+存储的成功/失败响应与 `/resolve` 形态、状态码一致；作业被取消时不落任何响应。
 
 ### 冲突响应（409）
 

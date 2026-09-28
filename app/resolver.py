@@ -382,6 +382,122 @@ def available_versions(index: PackageIndex, package: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Lock disposition
+# ---------------------------------------------------------------------------
+#
+# Lock dispositions are derived *after* the search finishes, never from the
+# mutable state of a branch: a higher candidate may adopt a lock, a deeper
+# transitive dependency may kill that whole branch, and the final successful
+# branch may never use the package at all.  Reading dispositions off the
+# final state is the only way to avoid reporting a failed exploration's
+# temporary "applied"/"backtracked" lock as a successful disposition.
+#
+# Dispositions on a successful solve:
+#   applied        - the lock version is the version in the final solution;
+#   backtracked    - the lock version was eligible under the final active
+#                    constraints but was falsified during the search, so
+#                    another version of the same package was selected;
+#   unsatisfiable  - the lock version exists but violates the final active
+#                    constraints, so another version was selected;
+#   unused         - the lock is valid (package/version known, version
+#                    eligible against the final constraints) but the final
+#                    solution does not use the package;
+#   missing-version / not-found - the locked version/package is absent.
+#
+# On a conflict/search-limit outcome there is no final branch, so only
+# branch-independent facts are reported: a globally-infeasible lock
+# (``unsatisfiable`` against the root requirements) and static index facts
+# (``missing-version`` / ``not-found``).  Transitive eligibility is
+# branch-local, so such locks are simply omitted rather than guessed.
+
+
+def _lock_is_eligible(
+    index: PackageIndex,
+    package: str,
+    lock: Version,
+    cs: list[Constraint],
+    allow_prereleases: bool,
+) -> bool:
+    """Whether ``lock`` would be lock-first candidate under ``cs``.
+
+    Mirrors :func:`build_candidates`: the locked version is eligible when it
+    is an index version that satisfies every constraint (its own pre-release
+    status is admitted by the lock).
+    """
+    candidates, _eligible = build_candidates(
+        index, package, cs, lock, allow_prereleases
+    )
+    return any(c.locked for c in candidates)
+
+
+def final_lock_notes(
+    index: PackageIndex,
+    locks: dict[str, Version],
+    chosen: dict[str, Version],
+    constraints: dict[str, list[Constraint]],
+    allow_prereleases: bool,
+) -> dict[str, str]:
+    """Disposition of every lock relative to the final successful solution."""
+    notes: dict[str, str] = {}
+    for pkg, lock in sorted(locks.items()):
+        if pkg not in index.versions:
+            notes[pkg] = "not-found"
+            continue
+        raw_versions = [v for v, _ in index.versions[pkg]]
+        if lock not in raw_versions:
+            notes[pkg] = "missing-version"
+            continue
+        if pkg in chosen:
+            if chosen[pkg] == lock:
+                notes[pkg] = "applied"
+            elif _lock_is_eligible(
+                index, pkg, lock, constraints.get(pkg, []), allow_prereleases
+            ):
+                # The lock satisfied the final constraints but was falsified
+                # in a dead branch and another version won.
+                notes[pkg] = "backtracked"
+            else:
+                notes[pkg] = "unsatisfiable"
+        else:
+            # A valid lock on a package the successful branch never needs.
+            notes[pkg] = "unused"
+    return notes
+
+
+def failed_lock_notes(
+    index: PackageIndex,
+    locks: dict[str, Version],
+    root_constraints: list[Constraint],
+    allow_prereleases: bool,
+) -> dict[str, str]:
+    """Branch-independent lock facts for a conflict/limit outcome.
+
+    Only dispositions that hold for *every* possible branch are reported, so
+    a lock provisionally adopted inside an abandoned branch is never exposed
+    as ``applied``/``backtracked``.
+    """
+    notes: dict[str, str] = {}
+    root_by_pkg: dict[str, list[Constraint]] = {}
+    for constraint in root_constraints:
+        root_by_pkg.setdefault(constraint.package, []).append(constraint)
+    for pkg, lock in sorted(locks.items()):
+        if pkg not in index.versions:
+            notes[pkg] = "not-found"
+            continue
+        raw_versions = [v for v, _ in index.versions[pkg]]
+        if lock not in raw_versions:
+            notes[pkg] = "missing-version"
+            continue
+        # A lock contradicting the root requirements is infeasible in every
+        # branch; transitive eligibility depends on the branch explored.
+        if pkg in root_by_pkg and not _lock_is_eligible(
+            index, pkg, lock, root_by_pkg[pkg], allow_prereleases
+        ):
+            notes[pkg] = "unsatisfiable"
+    return notes
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
@@ -435,10 +551,6 @@ def resolve(
     constraints: dict[str, list[Constraint]] = {}
     edges: list[tuple[str, Optional[str], str, str]] = []
     attempts = 0
-    lock_notes: dict[str, str] = {}
-
-    def note_lock(pkg: str, note: str) -> None:
-        lock_notes[pkg] = note
 
     def representative_hops(cs: list[Constraint]) -> tuple[tuple[str, str], ...]:
         """Hops leading to the constrained package, excluding its own node."""
@@ -526,21 +638,10 @@ def resolve(
             index, package, cs, lock, allow_prereleases
         )
 
-        if lock is not None:
-            if package not in index.versions:
-                note_lock(package, "not-found")
-            else:
-                raw_versions = [v for v, _ in index.versions[package]]
-                if lock not in raw_versions:
-                    note_lock(package, "missing-version")
-                elif not any(c.locked for c in candidates):
-                    note_lock(package, "unsatisfiable")
-
         if not candidates:
             return ("conflict", empty_leaf(package, cs))
 
         hops = representative_hops(cs)
-        lock_version = lock if any(c.locked for c in candidates) else None
         attempted: list[str] = []
         branch_failures: list[Any] = []
 
@@ -565,10 +666,6 @@ def resolve(
 
             version = candidate.version
             attempted.append(str(version))
-            if candidate.locked:
-                note_lock(package, "applied")
-            elif lock_version is not None and lock_notes.get(package) == "applied":
-                note_lock(package, "backtracked")
 
             # --- apply this candidate ---
             chosen[package] = version
@@ -719,17 +816,16 @@ def resolve(
                 bucket.remove(constraint)
                 if not bucket:
                     del constraints[constraint.package]
-        return SolveResult(
-            status, {}, attempts, [], conflict, dict(sorted(lock_notes.items()))
+        # No successful branch exists: report only branch-independent lock
+        # facts, never the temporary lock state of an abandoned exploration.
+        notes = failed_lock_notes(
+            index, locks, root_constraints, allow_prereleases
         )
+        return SolveResult(status, {}, attempts, [], conflict, notes)
 
-    for pkg, lock in locks.items():
-        if pkg in chosen:
-            lock_notes.setdefault(pkg, "applied" if chosen[pkg] == lock else "unused")
-        elif pkg in index.versions:
-            lock_notes.setdefault(pkg, "unused")
-        else:
-            lock_notes.setdefault(pkg, "not-found")
+    lock_notes = final_lock_notes(
+        index, locks, chosen, constraints, allow_prereleases
+    )
 
     success_edges = [
         {
@@ -748,5 +844,5 @@ def resolve(
         attempts=attempts,
         edges=success_edges,
         conflict=None,
-        lock_notes=dict(sorted(lock_notes.items())),
+        lock_notes=lock_notes,
     )

@@ -14,6 +14,19 @@ Resolution strategy
 * Search is depth-first with fully deterministic ordering.  Failures bubble
   up as structured conflicts carrying the involved packages and the exact
   dependency path that produced each mutually-exclusive constraint.
+
+Lock dispositions
+-----------------
+Lock verdicts (``locks`` in the result) are journaled per branch exactly like
+constraints and edges: a disposition written while trying an abandoned
+candidate is undone on backtracking, so the final report only ever describes
+the one successful branch.  A valid lock for a package that branch does not
+need is ``unused`` (even if an earlier, higher branch temporarily applied it);
+a lock version tried and disproven before another version is chosen is
+``backtracked``; the chosen lock version is ``applied``.  When the whole
+search fails or hits ``max_attempts`` there is no successful branch, so only
+statically provable dispositions are reported and transient branch states are
+never mistaken for success.
 """
 
 from __future__ import annotations
@@ -413,6 +426,26 @@ class SolveResult:
     lock_notes: dict[str, str]
 
 
+# Lock dispositions reported in a successful resolution.  They describe the
+# final winning branch only:
+_LOCK_APPLIED = "applied"          # the lock version is the chosen version
+_LOCK_BACKTRACKED = "backtracked"  # lock eligible but disproven; other version chosen
+_LOCK_UNSATISFIABLE = "unsatisfiable"  # lock cannot satisfy the active constraints
+_LOCK_MISSING = "missing-version"  # locked version absent from the supplied index
+_LOCK_NOT_FOUND = "not-found"      # locked package absent from the supplied index
+_LOCK_UNUSED = "unused"            # valid lock for a package the solution never needs
+
+
+def _lock_satisfies(lock: Version, constraints_: list[Constraint]) -> bool:
+    """Whether the locked version satisfies every given constraint.
+
+    Mirrors ``build_candidates``: a locked pre-release is exempt from the
+    default pre-release exclusion (the lock itself opts in), so eligibility is
+    purely a question of satisfying every active constraint.
+    """
+    return all(c.satisfied_by(lock) for c in constraints_)
+
+
 def resolve(
     index: PackageIndex,
     roots: list[ParsedDependency],
@@ -436,9 +469,45 @@ def resolve(
     edges: list[tuple[str, Optional[str], str, str]] = []
     attempts = 0
     lock_notes: dict[str, str] = {}
+    # Lock-note writes are journaled and passed up the recursion exactly like
+    # constraints and edges: notes produced inside an abandoned candidate are
+    # undone on rollback, so dispositions only ever describe the branch that
+    # ultimately survives.  Each choose() frame returns, on success, the undo
+    # log of every note write its winning branch made (its own plus those
+    # folded up from deeper winning frames).
+    LockEntry = tuple[str, Optional[str]]
 
-    def note_lock(pkg: str, note: str) -> None:
+    def set_lock_note(
+        pkg: str,
+        note: str,
+        undo: list[LockEntry],
+    ) -> None:
+        undo.append((pkg, lock_notes.get(pkg)))
         lock_notes[pkg] = note
+
+    def rollback_note_entries(entries: list[LockEntry]) -> None:
+        for pkg, previous in reversed(entries):
+            if previous is None:
+                lock_notes.pop(pkg, None)
+            else:
+                lock_notes[pkg] = previous
+
+    # Dispositions the *exhaustive* search proves without ever trying the
+    # lock as a winning choice: a pre-loop ``unsatisfiable`` classification
+    # recorded by a frame that terminates (the lock satisfies none of that
+    # frame's accumulated constraints).  Because an overall "conflict"
+    # result means every candidate of every demanded package was exhausted, a
+    # terminal frame's constraint set belongs to a fully explored failure
+    # path and the verdict is a genuine proof -- not a transient branch
+    # state.  On the search limit ("limit") these are discarded, since
+    # unexplored branches could still invalidate them.  Static index facts
+    # (not-found/missing-version) need no search and are handled separately.
+    proven_notes: dict[str, str] = {}
+
+    def record_proven(pkg: str, note: str, cs: list[Constraint]) -> None:
+        if note != _LOCK_UNSATISFIABLE or not cs:
+            return
+        proven_notes.setdefault(pkg, note)
 
     def representative_hops(cs: list[Constraint]) -> tuple[tuple[str, str], ...]:
         """Hops leading to the constrained package, excluding its own node."""
@@ -516,8 +585,17 @@ def resolve(
             edges.append(edge)
             sink.append(edge)
 
-    def choose(package: str) -> tuple[str, Any]:
-        """Try candidates for ``package``; return ("ok", None) or a conflict."""
+    def choose(package: str) -> tuple[str, Any, list[LockEntry]]:
+        """Try candidates for ``package``.
+
+        Returns ``(status, conflict, note_entries)``.  On ``ok`` the
+        ``note_entries`` undo log describes (and keeps applied) every lock
+        write the winning branch made: this frame's static classification and
+        winning candidate, plus every write folded up from deeper winning
+        frames; the parent either adopts it or rolls it all back when the
+        parent candidate itself loses.  On failure every write this frame
+        made has already been undone and the returned log is empty.
+        """
         nonlocal attempts
 
         cs = list(constraints.get(package, []))
@@ -526,21 +604,36 @@ def resolve(
             index, package, cs, lock, allow_prereleases
         )
 
+        # Static classification writes for this package.  They are undone if
+        # the frame ultimately fails; on success they survive with the frame.
+        class_entries: list[LockEntry] = []
+        class_note: Optional[str] = None
         if lock is not None:
             if package not in index.versions:
-                note_lock(package, "not-found")
+                class_note = _LOCK_NOT_FOUND
             else:
                 raw_versions = [v for v, _ in index.versions[package]]
                 if lock not in raw_versions:
-                    note_lock(package, "missing-version")
+                    class_note = _LOCK_MISSING
                 elif not any(c.locked for c in candidates):
-                    note_lock(package, "unsatisfiable")
+                    class_note = _LOCK_UNSATISFIABLE
+            if class_note is not None:
+                set_lock_note(package, class_note, class_entries)
+
+        def _fail(conflict_obj: Any) -> tuple[str, Any, list[LockEntry]]:
+            # A terminating frame proves its classification against the
+            # constraints it observed (used only on overall exhaustive
+            # failure), then journals out its own writes.
+            if class_note is not None:
+                record_proven(package, class_note, cs)
+            rollback_note_entries(class_entries)
+            return ("conflict", conflict_obj, [])
 
         if not candidates:
-            return ("conflict", empty_leaf(package, cs))
+            return _fail(empty_leaf(package, cs))
 
         hops = representative_hops(cs)
-        lock_version = lock if any(c.locked for c in candidates) else None
+        locked_candidate_present = any(c.locked for c in candidates)
         attempted: list[str] = []
         branch_failures: list[Any] = []
 
@@ -552,6 +645,7 @@ def resolve(
                 raise ResolutionCancelled(attempts)
             attempts += 1
             if attempts > max_attempts:
+                rollback_note_entries(class_entries)
                 limit = CompositeConflict(
                     package=package,
                     reason="search-limit",
@@ -561,14 +655,21 @@ def resolve(
                     children=list(branch_failures),
                     involved={package},
                 )
-                return ("limit", limit)
+                return ("limit", limit, [])
 
             version = candidate.version
             attempted.append(str(version))
+            # This candidate's own lock-note writes.  Deeper frames keep
+            # their own logs, so the current package is the only key touched
+            # directly here.
+            candidate_entries: list[LockEntry] = []
             if candidate.locked:
-                note_lock(package, "applied")
-            elif lock_version is not None and lock_notes.get(package) == "applied":
-                note_lock(package, "backtracked")
+                set_lock_note(package, _LOCK_APPLIED, candidate_entries)
+            elif locked_candidate_present:
+                # Lock-first ordering means the eligible lock was already
+                # tried and disproven; this fallback keeps the disposition
+                # only when the branch below succeeds.
+                set_lock_note(package, _LOCK_BACKTRACKED, candidate_entries)
 
             # --- apply this candidate ---
             chosen[package] = version
@@ -629,14 +730,24 @@ def resolve(
 
             if immediate is None:
                 # Recurse into the oldest not-yet-chosen demanded package.
-                status, conflict = solve_next()
+                child_status, child_conflict, child_entries = solve_next()
             else:
-                status, conflict = "conflict", immediate
+                child_status, child_conflict, child_entries = (
+                    "conflict",
+                    immediate,
+                    [],
+                )
 
-            if status == "ok":
-                return ("ok", None)
+            if child_status == "ok":
+                # Surviving candidate: keep the static classification, this
+                # candidate's writes and every deeper winning frame's writes.
+                surviving = class_entries + child_entries + candidate_entries
+                return ("ok", None, surviving)
 
             # --- rollback this candidate exactly ---
+            # A losing child already undid its own writes; its returned log
+            # is empty.  Undo only this candidate's own writes.
+            rollback_note_entries(candidate_entries)
             for new_constraint in reversed(added):
                 bucket = constraints.get(new_constraint.package)
                 if bucket is not None and new_constraint in bucket:
@@ -652,10 +763,18 @@ def resolve(
                 edges.remove(edge)
             del chosen[package]
 
-            if status == "limit":
-                return ("limit", conflict)
-            branch_failures.append(conflict)
+            if child_status == "limit":
+                rollback_note_entries(class_entries)
+                return ("limit", child_conflict, [])
+            branch_failures.append(child_conflict)
 
+        # Every candidate failed.  If this frame's own lock never became a
+        # candidate under the observed constraints, that fact survives the
+        # exhaustive proof (candidate-level applied/backtracked states were
+        # already journaled out with each losing branch).
+        if class_note is not None:
+            record_proven(package, class_note, cs)
+        rollback_note_entries(class_entries)
         involved = {package}
         for child in branch_failures:
             involved |= child.involved
@@ -670,14 +789,42 @@ def resolve(
                 children=list(branch_failures),
                 involved=involved,
             ),
+            [],
         )
 
-    def solve_next() -> tuple[str, Any]:
+    def solve_next() -> tuple[str, Any, list[LockEntry]]:
         """Choose the oldest demanded package without an assignment."""
         for pkg in demanded:
             if pkg not in chosen:
                 return choose(pkg)
-        return ("ok", None)
+        return ("ok", None, [])
+
+    def _static_failure_notes(
+        root_only: Optional[dict[str, list[Constraint]]] = None,
+    ) -> dict[str, str]:
+        """Lock dispositions provable without any tentative branch.
+
+        Used on overall failure and on the search limit, where no successful
+        branch exists to own an ``applied`` / ``backtracked`` / ``unused``
+        verdict.  Only index facts and, when supplied, constraints present on
+        *every* branch (the root requirements) can decide a disposition;
+        everything else is omitted rather than misreported from a dead
+        exploration.
+        """
+        notes: dict[str, str] = {}
+        for pkg, lock in locks.items():
+            root_cs = (root_only or {}).get(pkg)
+            if root_cs and not _lock_satisfies(lock, root_cs):
+                # A lock ruled out by the root requirements themselves is
+                # unselectable on every conceivable branch; report this even
+                # when the index lacks the package/version, since it is the
+                # more actionable contradiction.
+                notes[pkg] = _LOCK_UNSATISFIABLE
+            elif pkg not in index.versions:
+                notes[pkg] = _LOCK_NOT_FOUND
+            elif lock not in {v for v, _ in index.versions[pkg]}:
+                notes[pkg] = _LOCK_MISSING
+        return dict(sorted(notes.items()))
 
     # -- Seed root requirements --------------------------------------------
     root_constraints: list[Constraint] = []
@@ -703,33 +850,97 @@ def resolve(
                 available=available_versions(index, dep.name),
                 detail="root requirements contradict each other",
             )
-            return SolveResult("conflict", {}, 0, [], leaf, {})
+            seeded: dict[str, list[Constraint]] = {}
+            for c in root_constraints:
+                seeded.setdefault(c.package, []).append(c)
+            seeded.setdefault(dep.name, []).append(constraint)
+            return SolveResult(
+                "conflict", {}, 0, [], leaf, _static_failure_notes(seeded)
+            )
         root_constraints.append(constraint)
         constraints.setdefault(dep.name, []).append(constraint)
         if dep.name not in demanded:
             demanded.append(dep.name)
 
-    status, conflict = solve_next()
+    status, conflict, surviving_entries = solve_next()
 
-    # Root constraints are only used to seed; clean up on failure.
+    def _final_lock_disposition(
+        pkg: str, lock: Version, observed: dict[str, str]
+    ) -> str:
+        """Authoritative disposition of one lock against the final state.
+
+        Computed from request facts, the surviving branch's final
+        constraints/assignment and the lock notes that survived the branch
+        journaling, so no transient note from an abandoned branch can leak
+        through:
+
+        * ``not-found`` / ``missing-version`` — static index facts;
+        * ``applied`` — the lock version is exactly what the solution chose;
+        * ``backtracked`` — the lock was an eligible lock-first candidate that
+          the search tried and disproved, then chose another version;
+        * ``unsatisfiable`` — the lock could not satisfy the active
+          constraints, so it never became a candidate;
+        * ``unused`` — a perfectly valid lock for a package the solution does
+          not need at all.
+        """
+        if pkg not in index.versions:
+            return _LOCK_NOT_FOUND
+        raw_versions = [v for v, _ in index.versions[pkg]]
+        if lock not in raw_versions:
+            return _LOCK_MISSING
+        active = list(constraints.get(pkg, ()))
+        if pkg in chosen:
+            if chosen[pkg] == lock:
+                return _LOCK_APPLIED
+            eligible_at_finale = _lock_satisfies(lock, active)
+            if eligible_at_finale or observed.get(pkg) == _LOCK_BACKTRACKED:
+                # Eligible under the final constraints, or actually applied
+                # and disproven during the surviving search (e.g. a cycle
+                # adds the ruling-out constraint only after the choice): the
+                # lock was tried first and then abandoned.
+                return _LOCK_BACKTRACKED
+            # Never eligible under the active constraints.
+            return _LOCK_UNSATISFIABLE
+        # Package not needed by the final branch at all.
+        return _LOCK_UNUSED
+
     if status != "ok":
+        # Root constraints are only used to seed; clean them up.
         for constraint in reversed(root_constraints):
             bucket = constraints.get(constraint.package)
             if bucket is not None and constraint in bucket:
                 bucket.remove(constraint)
                 if not bucket:
                     del constraints[constraint.package]
+
+        # No successful branch exists, so nothing can honestly be reported as
+        # applied/backtracked/unused.  Start from the static request facts
+        # (unknown package/version) and the root-grounded proofs the
+        # exhaustive search recorded; these hold on every conceivable branch.
+        root_only: dict[str, list[Constraint]] = {}
+        for constraint in root_constraints:
+            root_only.setdefault(constraint.package, []).append(constraint)
+        failure_notes = _static_failure_notes(root_only)
+        for pkg, note in proven_notes.items():
+            failure_notes.setdefault(pkg, note)
+
         return SolveResult(
-            status, {}, attempts, [], conflict, dict(sorted(lock_notes.items()))
+            status, {}, attempts, [], conflict, dict(sorted(failure_notes.items()))
         )
 
-    for pkg, lock in locks.items():
-        if pkg in chosen:
-            lock_notes.setdefault(pkg, "applied" if chosen[pkg] == lock else "unused")
-        elif pkg in index.versions:
-            lock_notes.setdefault(pkg, "unused")
-        else:
-            lock_notes.setdefault(pkg, "not-found")
+    # Successful search: the winning branch's undo log is returned by the
+    # top frame; the surviving lock-note writes are the only in-search
+    # observations the final disposition trusts.
+    observed_notes = {
+        pkg: lock_notes[pkg]
+        for pkg, _previous in surviving_entries
+        if pkg in lock_notes
+    }
+
+    final_notes = {
+        pkg: _final_lock_disposition(pkg, lock, observed_notes)
+        for pkg, lock in locks.items()
+    }
 
     success_edges = [
         {
@@ -748,5 +959,5 @@ def resolve(
         attempts=attempts,
         edges=success_edges,
         conflict=None,
-        lock_notes=dict(sorted(lock_notes.items())),
+        lock_notes=dict(sorted(final_notes.items())),
     )

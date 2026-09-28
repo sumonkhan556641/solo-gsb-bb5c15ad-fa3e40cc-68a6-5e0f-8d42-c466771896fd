@@ -13,7 +13,11 @@
 - **锁定优先**：`locks` 中给出的版本只要仍满足所有约束，就会被优先保留；
   锁定版本被更深层依赖证伪时，才按规则回溯到其他版本，返回结果里会说明每个锁的
   处置（`applied` / `backtracked` / `unsatisfiable` / `missing-version` /
-  `not-found` / `unused`）。
+  `not-found` / `unused`）。处置只描述**最终成功分支**：曾在某次失败回溯中临时
+  采用的锁，若最终分支不再使用该包则为 `unused`；锁版本被证伪、最终改选其他版本
+  为 `backtracked`；锁版本即最终版本为 `applied`。整体无解或搜索触顶时，失败探索
+  中的临时处置一律不进入响应，只保留可由请求本身直接判定的
+  `not-found` / `missing-version` / `unsatisfiable`（后者仅限根需求即可证伪）。
 - **确定性回溯**：其余候选严格按版本**从高到低**尝试；候选顺序、依赖处理顺序、
   根需求顺序均为确定顺序，相同输入永远得到相同输出（含尝试次数）。
 - **默认排除预发布版**：`a/b/rc/dev` 等预发布默认不参与；可通过
@@ -1156,6 +1160,65 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 ```
 
 只要锁仍满足约束，`x` 解析为 `1.0`（而非最高的 `2.0`），`locks.x = "applied"`。
+
+`locks` 为请求里**每个**锁给出一个处置，处置只针对最终成功分支：
+
+| 处置 | 含义 |
+| --- | --- |
+| `applied` | 锁定版本就是最终选用版本。 |
+| `backtracked` | 锁版本满足当时约束、曾按“锁优先”试用，但被（含更深层传递约束的）搜索证伪，最终改选了其他版本。 |
+| `unsatisfiable` | 锁版本不满足最终生效约束，从未成为候选（例如根需求 `>=2.0` 而锁为 `1.0`）。 |
+| `missing-version` | 锁定包存在，但清单中没有该版本。 |
+| `not-found` | 锁定包本身不在清单中。 |
+| `unused` | 锁本身有效，但最终成功分支根本不需要这个包。 |
+
+关键语义：处置随**回溯**精确回滚。下面的例子里，较高版本 `app 2.0` 先引入并
+采用了 `locked-pkg==2.0`，但它要求的 `blocked` 因 `missing>=2.0` 无解；回溯到
+`app 1.0` 后最终分支不再使用 `locked-pkg`，因此该锁报 `unused` 而**不是**失败
+探索里临时出现过的 `applied`：
+
+```bash
+curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {
+      "2.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+      "1.0": {"dependencies": {"plain": ""}}
+    },
+    "locked-pkg": {"1.0": {}, "2.0": {}},
+    "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+    "missing": {"1.0": {}},
+    "plain": {"1.0": {}}
+  },
+  "root": {"app": ""},
+  "locks": {"locked-pkg": "2.0"}
+}'
+```
+
+响应（HTTP 200）：
+
+```json
+{
+  "status": "ok",
+  "attempts": 6,
+  "resolved": {"app": "1.0", "plain": "1.0"},
+  "dependency_graph": [ ... ],
+  "locks": {"locked-pkg": "unused"}
+}
+```
+
+反之，若锁版本在最终分支中确实被试用后证伪（例如锁定的 `x==1.0` 要求
+`y>=2.0`，而 `y` 只有 `1.0`，最终改选 `x==2.0`），则报 `backtracked`。
+
+**无解或搜索触顶（409）时不报告任何成功处置**：失败探索中临时写入的
+`applied` / `backtracked` 会随分支回滚一并撤销，绝不误报。
+
+- **无解（`conflict`）**：搜索已穷尽所有分支。响应里的 `locks` 给出无需成功
+  分支即可成立的处置——`not-found`、`missing-version`，以及被穷尽搜索证伪的
+  `unsatisfiable`（锁版本满足不了最终累积的约束，根约束或传递约束均可）；其余
+  有效锁不出现在 `locks` 中。
+- **搜索触顶（`limit` / `undetermined`）**：可能还有未探索的分支，因此只保留
+  `not-found` / `missing-version` 与根需求即可证伪的 `unsatisfiable`，连传递级
+  `unsatisfiable` 也不报告，绝不把尚未排除的锁判成无解。
 
 ### 冲突响应（409）
 

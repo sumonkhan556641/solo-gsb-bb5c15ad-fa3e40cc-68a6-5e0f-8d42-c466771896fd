@@ -126,6 +126,157 @@ def test_lock_backtracked_note_when_locked_choice_fails_deeper():
     assert result.lock_notes["x"] == "backtracked"
 
 
+def test_lock_used_only_in_abandoned_branch_is_unused_not_applied():
+    # A higher candidate adopts the locked package first, but an unrelated
+    # transitive requirement of that same candidate is impossible.  The
+    # winning fallback branch never needs the locked package at all, so the
+    # "applied" verdict the dead branch produced must not leak: the lock is
+    # unused in the final resolution.
+    packages = {
+        "app": {
+            "2.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+            "1.0": {"dependencies": {"plain": ""}},
+        },
+        "locked-pkg": {"1.0": {}, "2.0": {}},
+        "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+        "plain": {"1.0": {}},
+    }
+    result = solve(
+        packages, {"app": ""}, locks={"locked-pkg": "2.0"}
+    )
+    assert result.status == "ok"
+    assert result.chosen == {"app": "1.0", "plain": "1.0"}
+    assert "locked-pkg" not in result.chosen
+    assert result.lock_notes["locked-pkg"] == "unused"
+
+
+def test_lock_applied_deep_in_abandoned_branch_is_rolled_back():
+    # Same as above, but the locked package is pulled in one level deeper:
+    # its "applied" note has to travel up the surviving frame chain and be
+    # undone together with the losing top-level candidate.
+    packages = {
+        "app": {
+            "2.0": {"dependencies": {"middle": "", "blocked": ""}},
+            "1.0": {"dependencies": {"plain": ""}},
+        },
+        "middle": {"1.0": {"dependencies": {"locked-pkg": ""}}},
+        "locked-pkg": {"1.0": {}},
+        "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+        "plain": {"1.0": {}},
+    }
+    result = solve(packages, {"app": ""}, locks={"locked-pkg": "1.0"})
+    assert result.status == "ok"
+    assert result.chosen == {"app": "1.0", "plain": "1.0"}
+    assert result.lock_notes["locked-pkg"] == "unused"
+
+
+def test_locked_version_backtracked_after_immediate_conflict():
+    # The locked version is selected, then a package demanded later in the
+    # same branch requires an incompatible version of it ("rejected by prior
+    # choice").  The package is re-choosing to another version, so the lock
+    # was applied and disproven: backtracked, not unsatisfiable/unused.
+    packages = {
+        "app": {"2.0": {"dependencies": {"locked-pkg": "", "pinner": ""}}},
+        "pinner": {"1.0": {"dependencies": {"locked-pkg": "==1.0"}}},
+        "locked-pkg": {"1.0": {}, "2.0": {}},
+    }
+    result = solve(packages, {"app": ""}, locks={"locked-pkg": "2.0"})
+    assert result.status == "ok"
+    assert result.chosen["locked-pkg"] == "1.0"
+    assert result.lock_notes["locked-pkg"] == "backtracked"
+
+
+def test_failed_resolution_does_not_report_branch_lock_states():
+    # No solution: the lock was applied in every explored branch, but there
+    # is no successful branch to own that disposition, so it must not be
+    # reported as applied/backtracked.
+    packages = {
+        "app": {
+            "2.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+            "1.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+        },
+        "locked-pkg": {"1.0": {}, "2.0": {}},
+        "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+    }
+    result = solve(
+        packages,
+        {"app": ""},
+        locks={"locked-pkg": "2.0", "ghost": "1.0"},
+    )
+    assert result.status == "conflict"
+    assert "locked-pkg" not in result.lock_notes
+    assert result.lock_notes["ghost"] == "not-found"
+
+
+def test_search_limit_does_not_report_branch_lock_states():
+    packages = {
+        "app": {
+            "2.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+            "1.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+        },
+        "locked-pkg": {"1.0": {}, "2.0": {}},
+        "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+    }
+    result = solve(
+        packages, {"app": ""}, locks={"locked-pkg": "2.0"}, max_attempts=1
+    )
+    assert result.status == "limit"
+    assert "locked-pkg" not in result.lock_notes
+
+
+def test_failed_resolution_reports_root_unsatisfiable_lock():
+    # The root requirement alone rules the lock out; that fact holds on
+    # every branch and is therefore safe to report even on overall failure.
+    packages = {
+        "a": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+    }
+    result = solve(
+        packages,
+        {"a": "", "x": ">=2.0"},
+        locks={"x": "1.0", "ghost": "1.0"},
+    )
+    assert result.status == "conflict"
+    assert result.lock_notes["x"] == "unsatisfiable"
+    assert result.lock_notes["ghost"] == "not-found"
+
+
+def test_exhaustive_conflict_reports_transitive_unsatisfiable_lock():
+    # The lock is ruled out only by constraints accumulated along the
+    # explored branches.  An exhaustive conflict proves impossibility, so the
+    # verdict is factual and preserved (same as the historical behaviour).
+    packages = {
+        "a": {"1.0": {"dependencies": {"x": ">=2.0"}}},
+        "b": {"1.0": {"dependencies": {"x": "<2.0"}}},
+        "x": {"1.0": {}, "2.0": {}},
+    }
+    result = solve(packages, ["a", "b"], locks={"x": "1.0"})
+    assert result.status == "conflict"
+    assert result.lock_notes["x"] == "unsatisfiable"
+
+
+def test_search_limit_omits_transitive_unsatisfiable_lock():
+    # Same constraints, but the budget runs out before exhaustion: the
+    # transitive "unsatisfiable" verdict may not hold on unexplored branches,
+    # so it must be omitted (static index facts are still reported).
+    packages = {
+        "a": {"1.0": {"dependencies": {"x": ">=2.0"}}},
+        "b": {"1.0": {"dependencies": {"x": "<2.0"}}},
+        "x": {"1.0": {}, "2.0": {}},
+    }
+    result = solve(
+        packages, ["a", "b"], locks={"x": "1.0"}, max_attempts=1
+    )
+    assert result.status == "limit"
+    assert "x" not in result.lock_notes
+
+
+
+
 def test_self_dependency_does_not_deadlock():
     result = solve(
         {"x": {"1.0": {"dependencies": {"x": ">=1.0"}}}},

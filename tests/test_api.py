@@ -61,6 +61,52 @@ def test_lock_is_abandoned_when_unsatisfiable():
     assert body["locks"]["x"] == "unsatisfiable"
 
 
+def test_lock_used_only_in_abandoned_branch_is_unused():
+    # Higher app version adopts the locked package, but another transitive
+    # requirement of that branch is impossible; the winning fallback no
+    # longer uses the package.  Its dead-branch "applied" state must not be
+    # reported.
+    packages = {
+        "app": {
+            "2.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+            "1.0": {"dependencies": {"plain": ""}},
+        },
+        "locked-pkg": {"1.0": {}, "2.0": {}},
+        "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+        "plain": {"1.0": {}},
+    }
+    status, body = _resolve(packages=packages, root={"app": ""},
+                            locks={"locked-pkg": "2.0"})
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["resolved"] == {"app": "1.0", "plain": "1.0"}
+    assert body["locks"]["locked-pkg"] == "unused"
+
+
+def test_conflict_response_drops_branch_lock_states():
+    packages = {
+        "app": {
+            "2.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+            "1.0": {"dependencies": {"locked-pkg": "", "blocked": ""}},
+        },
+        "locked-pkg": {"1.0": {}, "2.0": {}},
+        "blocked": {"1.0": {"dependencies": {"missing": ">=2.0"}}},
+        "missing": {"1.0": {}},
+    }
+    status, body = _resolve(
+        packages=packages,
+        root={"app": ""},
+        locks={"locked-pkg": "2.0", "ghost": "1.0"},
+    )
+    assert status == 409
+    assert body["status"] == "conflict"
+    # No successful branch: dead-branch dispositions are not success verdicts.
+    assert "locked-pkg" not in body["locks"]
+    # Static facts survive.
+    assert body["locks"]["ghost"] == "not-found"
+
+
 def test_backtracking_finds_solution():
     status, body = _resolve(
         packages={
